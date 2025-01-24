@@ -337,8 +337,10 @@ class MultiHeadAttention(nn.Module):
     def _get_relative_embeddings(self, relative_embeddings, length):
         2 * self.window_size + 1
         # Pad first before slice to avoid using cond ops.
-        pad_length = max(length - (self.window_size + 1), 0)
-        slice_start_position = max((self.window_size + 1) - length, 0)
+        # pad_length = max(length - (self.window_size + 1), 0)
+        # slice_start_position = max((self.window_size + 1) - length, 0)
+        pad_length = length - (self.window_size + 1)
+        slice_start_position = 0
         slice_end_position = slice_start_position + 2 * length - 1
         if pad_length > 0:
             padded_relative_embeddings = F.pad(

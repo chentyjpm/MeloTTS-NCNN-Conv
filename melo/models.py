@@ -203,7 +203,7 @@ class StochasticDurationPredictor(nn.Module):
         if gin_channels != 0:
             self.cond = nn.Conv1d(gin_channels, filter_channels, 1)
 
-    def forward(self, x, x_mask, w=None, g=None, reverse=False, noise_scale=1.0):
+    def forward(self, x, x_mask, g=None, noise_scale=1.0):
         x = torch.detach(x)
         x = self.pre(x)
         if g is not None:
@@ -211,6 +211,9 @@ class StochasticDurationPredictor(nn.Module):
             x = x + self.cond(g)
         x = self.convs(x, x_mask)
         x = self.proj(x) * x_mask
+
+        reverse=True
+        w=None
 
         if not reverse:
             flows = self.flows
@@ -370,9 +373,10 @@ class TextEncoder(nn.Module):
             self.hidden_channels
         )  # [b, t, h]
         x = torch.transpose(x, 1, -1)  # [b, h, t]
-        x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(
-            x.dtype
-        )
+        #x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(
+        #    x.dtype
+        #    )
+        x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1)
 
         x = self.encoder(x * x_mask, x_mask, g=g)
         stats = self.proj(x) * x_mask
@@ -416,7 +420,10 @@ class ResidualCouplingBlock(nn.Module):
             )
             self.flows.append(modules.Flip())
 
-    def forward(self, x, x_mask, g=None, reverse=False):
+    def forward(self, x, x_mask, g=None):
+        
+        reverse=True
+
         if not reverse:
             for flow in self.flows:
                 x, _ = flow(x, x_mask, g=g, reverse=reverse)
@@ -885,7 +892,7 @@ class SynthesizerTrn(nn.Module):
         self.use_vc = use_vc
 
 
-    def forward(self, x, x_lengths, y, y_lengths, sid, tone, language, bert, ja_bert):
+    def forward_(self, x, x_lengths, y, y_lengths, sid, tone, language, bert, ja_bert):
         if self.n_speakers > 0:
             g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
         else:
@@ -962,6 +969,77 @@ class SynthesizerTrn(nn.Module):
             (z, z_p, m_p, logs_p, m_q, logs_q),
             (x, logw, logw_),
         )
+
+    def forward(
+        self,
+        x,
+        x_lengths,
+        sid,
+        tone,
+        language,
+        bert,
+        ja_bert,
+        #noise_scale=0.667,
+        #length_scale=1,
+        #noise_scale_w=0.8,
+        #max_len=None,
+        #sdp_ratio=0.2,
+        #y=None,
+        #g=None,
+    ):
+        # x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths, tone, language, bert)
+        # g = self.gst(y)
+        #if g is None:
+        #    if self.n_speakers > 0:
+        #        g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
+        #    else:
+        #        g = self.ref_enc(y.transpose(1, 2)).unsqueeze(-1)
+        #if self.use_vc:
+        #    g_p = None
+        #else:
+        #    g_p = g
+        
+        noise_scale=0.667;
+        length_scale=1;
+        noise_scale_w=0.8;
+        sdp_ratio=0.2;
+        max_len=None;
+
+        g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
+        g_p = g;
+
+        x, m_p, logs_p, x_mask = self.enc_p(
+            x, x_lengths, tone, language, bert, ja_bert, g=g_p
+        )
+        #logw = self.sdp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w) * (
+        #    sdp_ratio
+        #) + self.dp(x, x_mask, g=g) * (1 - sdp_ratio)
+        logw = self.sdp(x, x_mask, g=g, noise_scale=noise_scale_w) * (
+            sdp_ratio
+        ) + self.dp(x, x_mask, g=g) * (1 - sdp_ratio)
+        w = torch.exp(logw) * x_mask * length_scale
+        
+        w_ceil = torch.ceil(w)
+        y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
+        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(
+            x_mask.dtype
+        )
+        attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+        attn = commons.generate_path(w_ceil, attn_mask).to(dtype=torch.float)
+
+        m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(
+            1, 2
+        )  # [b, t', t], [b, t, d] -> [b, d, t']
+        logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(
+            1, 2
+        )  # [b, t', t], [b, t, d] -> [b, d, t']
+
+        z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
+        #z = self.flow(z_p, y_mask, g=g, reverse=True)
+        z = self.flow(z_p, y_mask, g=g)
+        o = self.dec((z * y_mask)[:, :, :max_len], g=g)
+        # print('max/min of o:', o.max(), o.min())
+        return o, attn, y_mask, (z, z_p, m_p, logs_p)
 
     def infer(
         self,

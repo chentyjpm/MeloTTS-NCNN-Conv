@@ -10,6 +10,9 @@ import torch.nn as nn
 from tqdm import tqdm
 import torch
 
+import onnxruntime
+import pnnx
+
 from . import utils
 from . import commons
 from .models import SynthesizerTrn
@@ -74,6 +77,7 @@ class TTS(nn.Module):
     @staticmethod
     def split_sentences_into_pieces(text, language, quiet=False):
         texts = split_sentence(text, language_str=language)
+        #分割句子
         if not quiet:
             print(" > Text split to sentences.")
             print('\n'.join(texts))
@@ -98,6 +102,10 @@ class TTS(nn.Module):
                 t = re.sub(r'([a-z])([A-Z])', r'\1 \2', t)
             device = self.device
             bert, ja_bert, phones, tones, lang_ids = utils.get_text_for_tts_infer(t, language, self.hps, device, self.symbol_to_id)
+            # bert 和 ja_bert 嵌入 
+            # phones 因素
+            # tones 语调
+            # lang_ids 语种信息
             with torch.no_grad():
                 x_tst = phones.to(device).unsqueeze(0)
                 tones = tones.to(device).unsqueeze(0)
@@ -107,6 +115,43 @@ class TTS(nn.Module):
                 x_tst_lengths = torch.LongTensor([phones.size(0)]).to(device)
                 del phones
                 speakers = torch.LongTensor([speaker_id]).to(device)
+
+                #add for pnnx
+
+                input_names = ['x_tst', 'x_tst_lengths', 'speakers', 'tones', 'lang_ids', 'bert', 'ja_bert', 'noise_scale', 'length_scale', 'noise_scale_w', 'sdp_ratio']
+                output_names = ['audio']
+                dynamic_axes = {
+                    'x_tst' : {1: 'seq_len'},
+                    'tones' : {1: 'seq_len'},
+                    'lang_ids' : {1: 'seq_len'},
+                    'bert' : {2: 'seq_len'},
+                    'ja_bert' : {2: 'seq_len'},
+                }
+                x = (x_tst, x_tst_lengths,speakers,tones,lang_ids,bert,ja_bert,torch.tensor([noise_scale]),torch.tensor([1. / speed]),torch.tensor([noise_scale_w]),torch.tensor([sdp_ratio]))
+                print(x)
+                dump_inputs = {
+                    'x_tst': x_tst, 
+                    'x_tst_lengths': x_tst_lengths, 
+                    'speakers': speakers, 
+                    'tones': tones, 
+                    'lang_ids': lang_ids, 
+                    'bert': bert, 
+                    'ja_bert': ja_bert, 
+                    'sdp_ratio': torch.tensor([sdp_ratio]), 
+                    'noise_scale': torch.tensor([noise_scale]), 
+                    'noise_scale_w': torch.tensor([noise_scale_w]), 
+                    'length_scale': torch.tensor([1. / speed])
+                }
+                model = self.model.cpu();
+                opt_model = pnnx.export(model, "melo.pt", x)
+
+                torch.jit.trace(model, x).save("melojit.pt")
+
+                #np.savez("melotts_en_inputs.npz", **dump_inputs)
+                #torch.onnx.export(self.model.cpu(), x, 'melotts_en.onnx', input_names=input_names, output_names=output_names, verbose='True', opset_version=12, dynamic_axes=dynamic_axes)
+                import sys
+                sys.exit(0)
+
                 audio = self.model.infer(
                         x_tst,
                         x_tst_lengths,
